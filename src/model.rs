@@ -115,6 +115,51 @@ fn filter_normalize_and_pad_compact(
     Tensor::stack(&padded_tensors, 0)
 }
 
+fn concatenate_embedding_batches(embeddings: Vec<Tensor>) -> Result<Tensor, candle_core::Error> {
+    if embeddings.is_empty() {
+        return Err(candle_core::Error::Msg(
+            "embedding batches cannot be empty".into(),
+        ));
+    }
+    if embeddings.len() == 1 {
+        return Ok(embeddings.into_iter().next().unwrap());
+    }
+
+    let mut max_tokens = 0;
+    let mut needs_padding = false;
+    for batch in &embeddings {
+        let (_, tokens, _) = batch.dims3()?;
+        if max_tokens == 0 {
+            max_tokens = tokens;
+        } else if tokens != max_tokens {
+            needs_padding = true;
+            max_tokens = max_tokens.max(tokens);
+        }
+    }
+
+    if !needs_padding {
+        return Tensor::cat(&embeddings, 0);
+    }
+
+    let mut padded_batches = Vec::with_capacity(embeddings.len());
+    for batch in embeddings {
+        let (batch_size, tokens, dim) = batch.dims3()?;
+        if tokens == max_tokens {
+            padded_batches.push(batch);
+            continue;
+        }
+
+        let padding = Tensor::zeros(
+            (batch_size, max_tokens - tokens, dim),
+            batch.dtype(),
+            batch.device(),
+        )?;
+        padded_batches.push(Tensor::cat(&[&batch, &padding], 1)?);
+    }
+
+    Tensor::cat(&padded_batches, 0)
+}
+
 /// The main ColBERT model structure.
 ///
 /// This struct encapsulates the language model, a linear projection layer,
@@ -313,10 +358,7 @@ impl ColBERT {
                 )
                 .collect::<Result<Vec<_>, _>>()?;
 
-            if all_embeddings.len() == 1 {
-                return Ok(all_embeddings.into_iter().next().unwrap());
-            }
-            return Tensor::cat(&all_embeddings, 0).map_err(ColbertError::from);
+            return concatenate_embedding_batches(all_embeddings).map_err(ColbertError::from);
         }
 
         // Fallback to sequential processing for GPU, WASM, or other devices.
@@ -337,11 +379,7 @@ impl ColBERT {
             all_embeddings.push(final_embeddings);
         }
 
-        if all_embeddings.len() == 1 {
-            return Ok(all_embeddings.remove(0));
-        }
-
-        Tensor::cat(&all_embeddings, 0).map_err(ColbertError::from)
+        concatenate_embedding_batches(all_embeddings).map_err(ColbertError::from)
     }
 
     /// Calculates the similarity scores between query and document embeddings.
@@ -457,8 +495,10 @@ impl ColBERT {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_normalize_and_pad_compact, normalize_and_mask_padded};
-    use candle_core::{Device, Tensor};
+    use super::{
+        concatenate_embedding_batches, filter_normalize_and_pad_compact, normalize_and_mask_padded,
+    };
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn fast_document_path_matches_compact_path_for_right_padded_masks() {
@@ -516,5 +556,17 @@ mod tests {
         assert!((fast[0][1][1] - 1.0).abs() < 1e-6);
         assert_eq!(fast[0][2], vec![0.0, 0.0]);
         assert_eq!(fast[0][3], vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn concatenate_embedding_batches_pads_variable_sequence_lengths() {
+        let device = Device::Cpu;
+        let first = Tensor::zeros((64, 514, 128), DType::F32, &device).unwrap();
+        let second = Tensor::zeros((64, 519, 128), DType::F32, &device).unwrap();
+
+        assert!(Tensor::cat(&[&first, &second], 0).is_err());
+
+        let combined = concatenate_embedding_batches(vec![first, second]).unwrap();
+        assert_eq!(combined.dims3().unwrap(), (128, 519, 128));
     }
 }
