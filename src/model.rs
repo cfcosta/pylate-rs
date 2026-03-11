@@ -45,6 +45,76 @@ impl BaseModel {
     }
 }
 
+/// Normalizes embeddings and zeros out masked rows without changing the sequence length.
+///
+/// This is the fast path used for document encoding. Documents are tokenized with
+/// right-padding to the batch longest sequence, so filtering rows out and then padding them
+/// back in produces the same layout as simply zeroing the masked rows after normalization.
+/// Keeping the whole operation on-device avoids per-row CPU roundtrips and tiny tensor ops.
+fn normalize_and_mask_padded(
+    embeddings: &Tensor,
+    attention_mask: &Tensor,
+) -> Result<Tensor, candle_core::Error> {
+    let normalized = normalize_l2(embeddings)?;
+    let mask = attention_mask.to_dtype(normalized.dtype())?.unsqueeze(2)?;
+    normalized.broadcast_mul(&mask)
+}
+
+/// Filters rows with a mask, normalizes the kept rows, and pads back to the batch max length.
+fn filter_normalize_and_pad_compact(
+    embeddings: &Tensor,
+    attention_mask: &Tensor,
+    device: &Device,
+) -> Result<Tensor, candle_core::Error> {
+    let (batch_size, _, dim) = embeddings.dims3()?;
+    let dtype = embeddings.dtype();
+    let mut processed_embeddings: Vec<Tensor> = Vec::with_capacity(batch_size);
+    let mut max_len = 0;
+
+    for i in 0..batch_size {
+        let single_embedding = embeddings.i(i)?;
+        let single_mask = attention_mask.i(i)?.to_vec1::<u32>()?;
+
+        let mut kept_rows = Vec::new();
+        for (j, &mask_val) in single_mask.iter().enumerate() {
+            if mask_val == 1 {
+                kept_rows.push(single_embedding.i(j)?);
+            }
+        }
+
+        let (normalized, current_len) = if kept_rows.is_empty() {
+            let zeros = Tensor::zeros((1, dim), dtype, device)?;
+            (zeros, 1)
+        } else {
+            let filtered = Tensor::stack(&kept_rows, 0)?;
+            let len = filtered.dim(0)?;
+            (normalize_l2(&filtered)?, len)
+        };
+
+        if current_len > max_len {
+            max_len = current_len;
+        }
+        processed_embeddings.push(normalized);
+    }
+
+    let mut padded_tensors = Vec::with_capacity(batch_size);
+    for tensor in &processed_embeddings {
+        let current_len = tensor.dim(0)?;
+        let dim = tensor.dim(1)?;
+        let pad_len = max_len - current_len;
+
+        if pad_len > 0 {
+            let padding = Tensor::zeros((pad_len, dim), dtype, device)?;
+            let padded = Tensor::cat(&[tensor, &padding], 0)?;
+            padded_tensors.push(padded);
+        } else {
+            padded_tensors.push(tensor.clone());
+        }
+    }
+
+    Tensor::stack(&padded_tensors, 0)
+}
+
 /// The main ColBERT model structure.
 ///
 /// This struct encapsulates the language model, a linear projection layer,
@@ -71,6 +141,7 @@ pub struct ColBERT {
 
 impl ColBERT {
     /// Creates a new instance of the `ColBERT` model from byte buffers.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         weights: Vec<u8>,
         dense_weights: Vec<u8>,
@@ -92,7 +163,7 @@ impl ColBERT {
         let config_value: serde_json::Value = serde_json::from_slice(&config_bytes)?;
         let architectures = config_value["architectures"]
             .as_array()
-            .and_then(|arr| arr.get(0))
+            .and_then(|arr| arr.first())
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 ColbertError::Operation("Missing or invalid 'architectures' in config.json".into())
@@ -155,7 +226,7 @@ impl ColBERT {
             linear,
             tokenizer,
             mask_token_id,
-            mask_token: mask_token,
+            mask_token,
             query_prefix,
             document_prefix,
             do_query_expansion,
@@ -173,72 +244,38 @@ impl ColBERT {
         ColbertBuilder::new(repo_id)
     }
 
-    /// Processes document embeddings by filtering based on an attention mask,
-    /// normalizing the results, and padding them to a uniform length.
+    /// Finalizes projected embeddings after the linear layer.
     ///
-    /// This method iterates through each embedding in the batch,
-    /// removes vectors corresponding to padding tokens (where attention_mask is 0),
-    /// normalizes the remaining vectors, and then pads all sequences with zeros to match
-    /// the longest sequence in the batch.
+    /// Documents use the fast on-device masking path. Queries without query expansion keep the
+    /// original compact-and-pad behavior so their padded suffix can still be removed.
+    fn finalize_embeddings(
+        &self,
+        projected_embeddings: &Tensor,
+        attention_mask: &Tensor,
+        is_query: bool,
+    ) -> Result<Tensor, candle_core::Error> {
+        if is_query {
+            if self.do_query_expansion {
+                normalize_l2(projected_embeddings).map_err(candle_core::Error::from)
+            } else {
+                self.filter_normalize_and_pad(projected_embeddings, attention_mask)
+            }
+        } else {
+            normalize_and_mask_padded(projected_embeddings, attention_mask)
+        }
+    }
+
+    /// Filters query embeddings based on an attention mask, normalizes the results,
+    /// and pads them to a uniform length.
+    ///
+    /// This compact-and-pad path is intentionally kept for queries without query expansion,
+    /// where shrinking away the masked suffix can reduce downstream similarity work.
     fn filter_normalize_and_pad(
         &self,
         embeddings: &Tensor,
         attention_mask: &Tensor,
     ) -> Result<Tensor, candle_core::Error> {
-        let (batch_size, _, dim) = embeddings.dims3()?;
-        let mut processed_embeddings: Vec<Tensor> = Vec::with_capacity(batch_size);
-        let mut max_len = 0;
-
-        // Iterate over each item in the batch.
-        for i in 0..batch_size {
-            let single_embedding = embeddings.i(i)?;
-            let single_mask = attention_mask.i(i)?.to_vec1::<u32>()?;
-
-            // Collect embedding vectors where the attention mask is 1.
-            let mut kept_rows = Vec::new();
-            for (j, &mask_val) in single_mask.iter().enumerate() {
-                if mask_val == 1 {
-                    kept_rows.push(single_embedding.i(j)?);
-                }
-            }
-
-            // Normalize the filtered embeddings.
-            let (normalized, current_len) = if kept_rows.is_empty() {
-                // If all tokens are masked, produce a single zero vector. This avoids errors
-                // with empty tensors and provides a valid, though empty, representation.
-                let zeros = Tensor::zeros((1, dim), DType::F32, &self.device)?;
-                (zeros, 1)
-            } else {
-                let filtered = Tensor::stack(&kept_rows, 0)?;
-                let len = filtered.dim(0)?;
-                (normalize_l2(&filtered)?, len)
-            };
-
-            // Track the maximum sequence length for padding later.
-            if current_len > max_len {
-                max_len = current_len;
-            }
-            processed_embeddings.push(normalized);
-        }
-
-        // Pad all processed embeddings to the maximum length found in the batch.
-        let mut padded_tensors = Vec::with_capacity(batch_size);
-        for tensor in processed_embeddings.iter() {
-            let current_len = tensor.dim(0)?;
-            let dim = tensor.dim(1)?; // Should be the same for all
-            let pad_len = max_len - current_len;
-
-            if pad_len > 0 {
-                let padding = Tensor::zeros((pad_len, dim), DType::F32, &self.device)?;
-                let padded = Tensor::cat(&[tensor, &padding], 0)?;
-                padded_tensors.push(padded);
-            } else {
-                padded_tensors.push(tensor.clone());
-            }
-        }
-
-        // Stack the padded tensors into a single batch tensor.
-        Tensor::stack(&padded_tensors, 0)
+        filter_normalize_and_pad_compact(embeddings, attention_mask, &self.device)
     }
 
     /// Encodes a batch of sentences (queries or documents) into embeddings.
@@ -270,14 +307,8 @@ impl ColBERT {
                                 .forward(&token_ids, &attention_mask, &token_type_ids)?;
                         let projected_embeddings = self.linear.forward(&token_embeddings)?;
 
-                        if !self.do_query_expansion || !is_query {
-                            // Apply filtering, normalization, and padding.
-                            self.filter_normalize_and_pad(&projected_embeddings, &attention_mask)
-                                .map_err(ColbertError::from)
-                        } else {
-                            // Original behavior: just normalize.
-                            normalize_l2(&projected_embeddings)
-                        }
+                        self.finalize_embeddings(&projected_embeddings, &attention_mask, is_query)
+                            .map_err(ColbertError::from)
                     },
                 )
                 .collect::<Result<Vec<_>, _>>()?;
@@ -300,13 +331,8 @@ impl ColBERT {
 
             let projected_embeddings = self.linear.forward(&token_embeddings)?;
 
-            let final_embeddings = if !self.do_query_expansion || !is_query {
-                // Apply filtering, normalization, and padding.
-                self.filter_normalize_and_pad(&projected_embeddings, &attention_mask)?
-            } else {
-                // Original behavior: just normalize.
-                normalize_l2(&projected_embeddings)?
-            };
+            let final_embeddings =
+                self.finalize_embeddings(&projected_embeddings, &attention_mask, is_query)?;
 
             all_embeddings.push(final_embeddings);
         }
@@ -426,5 +452,69 @@ impl ColBERT {
         }
 
         Ok((token_ids, attention_mask, token_type_ids))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_normalize_and_pad_compact, normalize_and_mask_padded};
+    use candle_core::{Device, Tensor};
+
+    #[test]
+    fn fast_document_path_matches_compact_path_for_right_padded_masks() {
+        let device = Device::Cpu;
+        let embeddings = Tensor::from_vec(
+            vec![
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // doc 1
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, // doc 2
+            ],
+            (2, 4, 2),
+            &device,
+        )
+        .unwrap();
+        let attention_mask =
+            Tensor::from_vec(vec![1u32, 1, 1, 1, 1, 1, 0, 0], (2, 4), &device).unwrap();
+
+        let compact =
+            filter_normalize_and_pad_compact(&embeddings, &attention_mask, &device).unwrap();
+        let fast = normalize_and_mask_padded(&embeddings, &attention_mask).unwrap();
+
+        let compact = compact.to_vec3::<f32>().unwrap();
+        let fast = fast.to_vec3::<f32>().unwrap();
+
+        assert_eq!(compact.len(), fast.len());
+        for (compact_doc, fast_doc) in compact.iter().zip(fast.iter()) {
+            assert_eq!(compact_doc.len(), fast_doc.len());
+            for (compact_row, fast_row) in compact_doc.iter().zip(fast_doc.iter()) {
+                assert_eq!(compact_row.len(), fast_row.len());
+                for (compact_value, fast_value) in compact_row.iter().zip(fast_row.iter()) {
+                    assert!((compact_value - fast_value).abs() < 1e-6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_document_path_zeroes_masked_rows() {
+        let device = Device::Cpu;
+        let embeddings = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0],
+            (1, 4, 2),
+            &device,
+        )
+        .unwrap();
+        let attention_mask = Tensor::from_vec(vec![1u32, 1, 0, 0], (1, 4), &device).unwrap();
+
+        let fast = normalize_and_mask_padded(&embeddings, &attention_mask)
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+
+        assert!((fast[0][0][0] - 1.0).abs() < 1e-6);
+        assert!((fast[0][0][1] - 0.0).abs() < 1e-6);
+        assert!((fast[0][1][0] - 0.0).abs() < 1e-6);
+        assert!((fast[0][1][1] - 1.0).abs() < 1e-6);
+        assert_eq!(fast[0][2], vec![0.0, 0.0]);
+        assert_eq!(fast[0][3], vec![0.0, 0.0]);
     }
 }

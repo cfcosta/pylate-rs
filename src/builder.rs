@@ -191,11 +191,9 @@ impl TryFrom<ColbertBuilder> for ColBERT {
                 .to_string()
         });
 
-        let final_do_query_expansion = builder.do_query_expansion.unwrap_or_else(|| {
-            st_config["do_query_expansion"]
-                .as_bool()
-                .unwrap_or(true)
-        });
+        let final_do_query_expansion = builder
+            .do_query_expansion
+            .unwrap_or_else(|| st_config["do_query_expansion"].as_bool().unwrap_or(true));
 
         let final_attend_to_expansion_tokens =
             builder.attend_to_expansion_tokens.unwrap_or_else(|| {

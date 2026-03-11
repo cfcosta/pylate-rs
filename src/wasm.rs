@@ -37,9 +37,7 @@ impl ColBERT {
             .as_str()
             .unwrap_or("[D]")
             .to_string();
-        let do_query_expansion = st_config["do_query_expansion"]
-            .as_bool()
-            .unwrap_or(true);
+        let do_query_expansion = st_config["do_query_expansion"].as_bool().unwrap_or(true);
         let attend_to_expansion_tokens = st_config["attend_to_expansion_tokens"]
             .as_bool()
             .unwrap_or(false);
